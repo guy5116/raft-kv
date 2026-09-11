@@ -50,7 +50,40 @@ func (r *Raft) becomeFollowerLocked(term int) {
 //  5. If granting: set r.votedFor, persist(), resetElectionTimerLocked()
 //     — granting a vote counts as "heard from someone legitimate".
 func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// TODO(you): implement (milestone 1).
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	defer func() { reply.Term = r.currentTerm }()
+
+	//Is this a request from a past Term?
+	if args.Term < r.currentTerm {
+		reply.VoteGranted = false
+		return
+	}
+
+	//Is this newer then the current?
+	if args.Term > r.currentTerm {
+		r.becomeFollowerLocked(args.Term)
+	}
+
+	//Have we voted yet or am I voting for the same candidate again?
+	canVote := r.votedFor == -1 || r.votedFor == args.CandidateID
+
+	//Is this candidate up to date?
+	//Needed as their logs with be seen as truth so must be current
+	myLastIdx := r.log.LastIndex()
+	myLastTerm := r.log.Term(myLastIdx)
+	upToDate := args.LastLogTerm > myLastTerm ||
+		(args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIdx)
+
+	if canVote && upToDate {
+		r.votedFor = args.CandidateID
+		r.persist()
+		r.resetElectionTimerLocked()
+		reply.VoteGranted = true
+		r.debugLocked("granted vote to n%d in term %d", args.CandidateID, r.currentTerm)
+		return
+	}
+	reply.VoteGranted = false
 }
 
 // startElection converts to candidate and canvasses the cluster for
@@ -81,7 +114,54 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // again and a fresh election starts in a higher term — you get retry for
 // free, no extra code.
 func (r *Raft) startElection() {
-	// TODO(you): implement (milestone 1).
+
+	r.mu.Lock()
+	r.state = Candidate
+	r.currentTerm++
+	r.votedFor = r.me
+	r.persist()
+	r.resetElectionTimerLocked()
+
+	term := r.currentTerm
+	lastIdx := r.log.LastIndex()
+	lastTerm := r.log.Term(lastIdx)
+
+	r.mu.Unlock()
+
+	votes := 1
+	for _, peer := range r.peers {
+		if peer == r.me {
+			continue
+		}
+		go func(peer int) {
+			args := &RequestVoteArgs{term, r.me, lastIdx, lastTerm}
+			reply := &RequestVoteReply{}
+			if !r.callRequestVote(peer, args, reply) {
+				return
+			}
+
+			r.mu.Lock()
+			defer r.mu.Unlock()
+
+			if reply.Term > r.currentTerm {
+				r.becomeFollowerLocked(reply.Term)
+				return
+			}
+
+			if r.currentTerm != term || r.state != Candidate {
+				return
+			}
+
+			if reply.VoteGranted {
+				votes++
+
+				if votes > len(r.peers)/2 {
+					r.becomeLeaderLocked()
+				}
+			}
+
+		}(peer)
+	}
 }
 
 // becomeLeaderLocked initializes leader state and starts heartbeats.
